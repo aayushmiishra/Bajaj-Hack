@@ -1,120 +1,47 @@
-from qdrant_client import QdrantClient
-from qdrant_client.models import Filter, FieldCondition, MatchValue
-from .models import CaseDocument, RetrievalResult
+from langchain_openai import OpenAIEmbeddings
+from langchain_qdrant import QdrantVectorStore
+from .models import CaseDocument
+from .parser import parse_document
 import numpy as np
-from typing import List, Optional
+from dotenv import load_dotenv
+from typing import List
 
+load_dotenv()
 
-class QdrantRetrievalEngine:
-    """Retrieval engine using Qdrant with MMR diversification"""
-    
-    def __init__(self, 
-                 embedding_model,
-                 collection_name: str = "legal_cases",
-                 host: str = "localhost",
-                 port: int = 6333):
-        self.client = QdrantClient(host=host, port=port)
-        self.embedding_model = embedding_model
-        self.collection_name = collection_name
-    
-    def retrieve_cases(self,
-                      query: str,
-                      k: int = 5,
-                      diversity: float = 0.7,
-                      source_filter: Optional[str] = None) -> List[RetrievalResult]:
-        """
-        Retrieve top-k cases using MMR diversification
-        """
-        # Embed the query
-        query_vector = self.embedding_model.embed_query(query)
+def index_to_qdrant(url: str, collection_name: str = "legal_cases") -> List[CaseDocument]:
+    """Index document to Qdrant and return list of CaseDocuments"""
+    try:
+        # Parse document
+        split_docs = parse_document(url)
+        print(f"📊 Created {len(split_docs)} chunks")
         
-        # Build filter if needed
-        qdrant_filter = None
-        if source_filter:
-            qdrant_filter = Filter(
-                must=[FieldCondition(
-                    key="metadata.source", 
-                    match=MatchValue(value=source_filter)
-                )]
-            )
+        # Generate embeddings
+        embedding_model = OpenAIEmbeddings(model="text-embedding-3-large")
         
-        # First-stage retrieval: Get top 100 candidates
-        candidates = self.client.search(
-            collection_name=self.collection_name,
-            query_vector=query_vector,
-            query_filter=qdrant_filter,
-            limit=100,
-            with_payload=True,
-            with_vectors=True
+        # Store in Qdrant
+        vector_store = QdrantVectorStore.from_documents(
+            documents=split_docs,
+            url="http://localhost:6333",
+            collection_name=collection_name,
+            embedding=embedding_model
         )
         
-        # Convert to RetrievalResult objects
-        candidate_results = []
-        for hit in candidates:
+        # Create CaseDocuments with embeddings
+        embeddings = embedding_model.embed_documents([doc.page_content for doc in split_docs])
+        case_docs = []
+        
+        for i, (doc, emb) in enumerate(zip(split_docs, embeddings)):
             case_doc = CaseDocument(
-                id=hit.id,
-                content=hit.payload["page_content"],
-                vector=np.array(hit.vector),
-                metadata=hit.payload.get("metadata", {})
+                id=f"{url}-{i}",
+                content=doc.page_content,
+                vector=np.array(emb),
+                metadata=doc.metadata
             )
-            candidate_results.append(
-                RetrievalResult(case=case_doc, score=hit.score)
-            )
+            case_docs.append(case_doc)
         
-        # Apply MMR diversification
-        return self._apply_mmr(candidate_results, query_vector, k, diversity)
-    
-    def _apply_mmr(self, 
-                  candidates: List[RetrievalResult], 
-                  query_vector: np.ndarray,
-                  k: int,
-                  diversity: float) -> List[RetrievalResult]:
-        """Apply Maximal Marginal Relevance diversification"""
-        results = []
-        selected_vectors = []
+        print("✅ Indexing completed successfully!")
+        return case_docs
         
-        # Normalize query vector
-        query_norm = np.linalg.norm(query_vector)
-        if query_norm > 0:
-            query_vector = query_vector / query_norm
-        
-        for rank in range(1, k + 1):
-            if not candidates:
-                break
-
-            best_score = -10_000
-            best_idx = -1
-
-            for idx, candidate in enumerate(candidates):
-                # Normalize candidate vector
-                candidate_vector = candidate.case.vector
-                candidate_norm = np.linalg.norm(candidate_vector)
-                if candidate_norm > 0:
-                    candidate_vector = candidate_vector / candidate_norm
-                
-                # Relevance to query
-                rel_score = np.dot(candidate_vector, query_vector)
-
-                # Diversity penalty
-                div_penalty = 0
-                if selected_vectors:
-                    similarities = np.dot(selected_vectors, candidate_vector)
-                    div_penalty = np.max(similarities)
-
-                # MMR scoring
-                mmr_score = diversity * rel_score - (1 - diversity) * div_penalty
-
-                if mmr_score > best_score:
-                    best_score = mmr_score
-                    best_idx = idx
-
-            if best_idx >= 0:
-                best = candidates.pop(best_idx)
-                best.rank = rank
-                best.score = best_score
-                results.append(best)
-                
-                # Store normalized vector for diversity comparison
-                selected_vectors.append(best.case.vector / np.linalg.norm(best.case.vector))
-
-        return results
+    except Exception as e:
+        print(f"❌ Indexing error: {e}")
+        return []
